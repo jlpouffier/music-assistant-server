@@ -514,6 +514,13 @@ class StreamsController(CoreController):
                     "float", queue_item.extra_attributes.get("playback_speed", 1.0)
                 ),
             )
+        # Apply audio overlay (e.g. rain sounds) if any plugin is active for this player.
+        if overlay := self.audio.get_active_overlay(player.player_id):
+            rain_reader, rain_vol = overlay
+            audio_input = self.audio.apply_rain_overlay(
+                audio_input, rain_reader, rain_vol, pcm_format
+            )
+
         # stream the audio
         # this final ffmpeg process in the chain will convert the raw, lossless PCM audio into
         # the desired output format for the player including any player specific filter params
@@ -584,7 +591,7 @@ class StreamsController(CoreController):
             )
         return resp
 
-    async def serve_queue_flow_stream(self, request: web.Request) -> web.StreamResponse:
+    async def serve_queue_flow_stream(self, request: web.Request) -> web.StreamResponse:  # noqa: PLR0915
         """Stream Queue Flow audio to player."""
         self._log_request(request)
         queue_id = request.match_info["queue_id"]
@@ -650,10 +657,18 @@ class StreamsController(CoreController):
         # such as channels mixing, DSP, resampling and, only if needed, encoding to lossy formats
         self.logger.debug("Start serving Queue flow audio stream for %s", queue.display_name)
 
+        flow_audio_input = self.audio.get_queue_flow_stream(
+            queue=queue, start_queue_item=start_queue_item, pcm_format=flow_pcm_format
+        )
+        # Apply audio overlay (e.g. rain sounds) if any plugin is active for this player.
+        if overlay := self.audio.get_active_overlay(player.player_id):
+            rain_reader, rain_vol = overlay
+            flow_audio_input = self.audio.apply_rain_overlay(
+                flow_audio_input, rain_reader, rain_vol, flow_pcm_format
+            )
+
         async for chunk in get_ffmpeg_stream(
-            audio_input=self.audio.get_queue_flow_stream(
-                queue=queue, start_queue_item=start_queue_item, pcm_format=flow_pcm_format
-            ),
+            audio_input=flow_audio_input,
             input_format=flow_pcm_format,
             output_format=output_format,
             filter_params=self.audio.get_player_filter_params(
@@ -949,19 +964,34 @@ class StreamsController(CoreController):
                 flow_stream = self.audio.get_queue_flow_stream(
                     queue=queue, start_queue_item=start_queue_item, pcm_format=pcm_format
                 )
+                # Apply audio overlay (e.g. rain sounds) if any plugin is active for this player.
+                # Use queue_id (the queue owner) not player_id (which may be a transport bridge).
+                if overlay := self.audio.get_active_overlay(queue_id):
+                    rain_reader, rain_vol = overlay
+                    flow_stream = self.audio.apply_rain_overlay(
+                        flow_stream, rain_reader, rain_vol, pcm_format
+                    )
                 if use_flow_stream_buffering:
                     return buffered(flow_stream, buffer_size=30, min_buffer_before_yield=1)
                 return flow_stream
             # single item stream (e.g. radio or non-flow mode)
             queue_item = self.mass.player_queues.get_item(media.source_id, media.queue_item_id)
             assert queue_item
-            return self.audio.get_queue_item_stream(
+            item_stream = self.audio.get_queue_item_stream(
                 queue_item=queue_item,
                 pcm_format=pcm_format,
                 playback_speed=cast(
                     "float", queue_item.extra_attributes.get("playback_speed", 1.0)
                 ),
             )
+            # Apply audio overlay (e.g. rain sounds) if any plugin is active for this player.
+            # Use queue_id (the queue owner) not player_id (which may be a transport bridge).
+            if overlay := self.audio.get_active_overlay(queue_id):
+                rain_reader, rain_vol = overlay
+                item_stream = self.audio.apply_rain_overlay(
+                    item_stream, rain_reader, rain_vol, pcm_format
+                )
+            return item_stream
         # assume url or some other direct path
         # NOTE: this will fail if its an uri not playable by ffmpeg
         return get_ffmpeg_stream(

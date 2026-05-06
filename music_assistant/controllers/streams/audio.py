@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import aiofiles
 import aiohttp
+import numpy as np
 import shortuuid
 from aiohttp import ClientConnectorSSLError, ClientResponseError, ClientTimeout
 from music_assistant_models.dsp import DSPConfig, DSPDetails, DSPState
@@ -29,6 +30,7 @@ from music_assistant_models.enums import (
     MediaType,
     PlayerFeature,
     PlayerType,
+    ProviderType,
     StreamType,
     VolumeNormalizationMode,
 )
@@ -2244,3 +2246,62 @@ class StreamsAudio:
 
         except Exception as err:
             self.logger.debug("Error fetching HLS metadata: %s", err)
+
+    # ------------------------------------------------------------------
+    # Audio overlay support (used by Rain Mood and similar plugins)
+    # ------------------------------------------------------------------
+
+    def get_active_overlay(self, player_id: str) -> tuple[Any, float] | None:
+        """
+        Return (rain_reader, volume) if any loaded plugin has an active audio overlay for player.
+
+        :param player_id: The player to check.
+        :returns: (read_callable, volume_0_to_1) or None.
+        """
+        for prov in self.mass.providers:
+            if prov.type != ProviderType.PLUGIN:
+                continue
+            if callable(get_overlay := getattr(prov, "get_player_overlay", None)):
+                if overlay := get_overlay(player_id):
+                    return cast("tuple[Any, float]", overlay)
+        return None
+
+    async def apply_rain_overlay(
+        self,
+        music_gen: AsyncGenerator[bytes, None],
+        rain_reader: Any,
+        rain_vol: float,
+        pcm_format: AudioFormat,
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Wrap a PCM generator with a rain audio overlay mixed in.
+
+        Reads rain PCM from a persistent provider-managed source (rain_reader)
+        and mixes each chunk with the music using numpy.  When the rain reader
+        returns None the music is passed through without overlay.
+
+        :param music_gen: Async generator producing raw PCM bytes.
+        :param rain_reader: Async callable (n: int) -> bytes | None from the plugin buffer.
+        :param rain_vol: Rain amplitude multiplier (0.0-1.0).
+        :param pcm_format: PCM format of the music_gen output.
+        """
+        fmt = pcm_format.content_type.value
+        if "f32" in fmt:
+            dtype: Any = np.float32
+            clip_min, clip_max = -1.0, 1.0
+        else:
+            dtype = np.int16
+            clip_min, clip_max = -32768, 32767
+
+        async for music_chunk in music_gen:
+            rain_chunk = await rain_reader(len(music_chunk))
+            if rain_chunk is None or len(rain_chunk) < len(music_chunk):
+                # Rain buffer ended; pass remaining music through without overlay.
+                yield music_chunk
+                async for remaining in music_gen:
+                    yield remaining
+                return
+            rain_arr = np.frombuffer(rain_chunk, dtype=dtype)
+            music_arr = np.frombuffer(music_chunk, dtype=dtype)
+            mixed = np.clip(music_arr + rain_arr * rain_vol, clip_min, clip_max).astype(dtype)
+            yield mixed.tobytes()

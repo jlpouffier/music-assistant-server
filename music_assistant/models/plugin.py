@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mashumaro import field_options, pass_through
 from music_assistant_models.enums import ContentType, StreamType
@@ -197,6 +197,19 @@ class PluginProvider(Provider):
         :return: The AI response as a string.
         """
         raise NotImplementedError
+
+    def get_player_overlay(self, player_id: str) -> tuple[Any, float] | None:
+        """
+        Return an audio overlay to mix into this player's queue stream.
+
+        Plugins can override this to inject a continuous background audio source
+        (e.g. ambient sound) into the regular queue playback without replacing it.
+
+        :param player_id: The player for which an overlay is requested.
+        :returns: (read_callable, volume_0_to_1) if an overlay is active, else None.
+                  read_callable is async (n: int) -> bytes | None.
+        """
+        return None
 
     async def resolve_image(self, path: str) -> str | bytes:
         """

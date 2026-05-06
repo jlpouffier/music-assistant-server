@@ -1,0 +1,12 @@
+{
+  "type": "plugin",
+  "stage": "experimental",
+  "domain": "rain_mood",
+  "name": "Rainy Mood",
+  "description": "Mix ambient rain sounds from rainymood.com with your currently playing music.",
+  "codeowners": [],
+  "requirements": [],
+  "multi_instance": false,
+  "builtin": false,
+  "icon": "weather-rainy"
+}
