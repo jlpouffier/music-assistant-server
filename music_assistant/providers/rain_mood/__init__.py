@@ -31,8 +31,7 @@ if TYPE_CHECKING:
 
 RAIN_URL = "https://media.rainymood.com/0.mp3"
 
-CONF_RAIN_VOLUME = "rain_volume"
-CONF_MUSIC_VOLUME = "music_volume"
+CONF_RAIN_RATIO = "rain_ratio"
 
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
 
@@ -60,20 +59,12 @@ async def get_config_entries(
     """
     return (
         ConfigEntry(
-            key=CONF_RAIN_VOLUME,
+            key=CONF_RAIN_RATIO,
             type=ConfigEntryType.INTEGER,
-            range=(0, 100),
-            default_value=40,
-            label="Rain Volume",
-            description="Volume of the rain sound (0-100 %).",
-        ),
-        ConfigEntry(
-            key=CONF_MUSIC_VOLUME,
-            type=ConfigEntryType.INTEGER,
-            range=(0, 100),
+            range=(0, 200),
             default_value=100,
-            label="Music Volume",
-            description="Volume of the music when rain is active (0-100 %).",
+            label="Rain Volume Ratio (%)",
+            description="Rain loudness relative to the music. 100 % = equally loud, 0 % = inaudible, 200 % = twice as loud.",
         ),
     )
 
@@ -209,7 +200,7 @@ class RainyMoodPlugin(PluginProvider):
         buf = self._rain_buffers.get(player_id)
         if buf is None:
             return None
-        rain_vol = float(cast("int", self.config.get_value(CONF_RAIN_VOLUME))) / 100.0
+        rain_vol = float(cast("int", self.config.get_value(CONF_RAIN_RATIO))) / 100.0
         return (buf.read, rain_vol)
 
     # ------------------------------------------------------------------
