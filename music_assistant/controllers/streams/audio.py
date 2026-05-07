@@ -30,7 +30,7 @@ from music_assistant_models.enums import (
     MediaType,
     PlayerFeature,
     PlayerType,
-    ProviderType,
+    ProviderFeature,
     StreamType,
     VolumeNormalizationMode,
 )
@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.music_provider import MusicProvider
     from music_assistant.models.player import Player
+    from music_assistant.models.plugin import PluginProvider
     from music_assistant.providers.sync_group import SyncGroupPlayer
 
 # ruff: noqa: PLR0915
@@ -2251,39 +2252,61 @@ class StreamsAudio:
     # Audio overlay support (used by Rain Mood and similar plugins)
     # ------------------------------------------------------------------
 
-    def get_active_overlay(self, player_id: str) -> tuple[Any, float] | None:
+    def get_active_overlay_provider(self, player_id: str) -> PluginProvider | None:
         """
-        Return (rain_reader, volume) if any loaded plugin has an active audio overlay for player.
+        Return the first plugin with AUDIO_OVERLAY feature that is active for the given player.
 
         :param player_id: The player to check.
-        :returns: (read_callable, volume_0_to_1) or None.
+        :returns: PluginProvider instance, or None.
         """
         for prov in self.mass.providers:
-            if prov.type != ProviderType.PLUGIN:
+            if ProviderFeature.AUDIO_OVERLAY not in prov.supported_features:
                 continue
-            if callable(get_overlay := getattr(prov, "get_player_overlay", None)):
-                if overlay := get_overlay(player_id):
-                    return cast("tuple[Any, float]", overlay)
+            if prov.is_overlay_active(player_id):  # type: ignore[union-attr]
+                return prov  # type: ignore[return-value]
         return None
 
-    async def apply_rain_overlay(
+    async def wrap_overlay_if_active(
         self,
-        music_gen: AsyncGenerator[bytes, None],
-        rain_reader: Any,
-        rain_vol: float,
+        audio_input: AsyncGenerator[bytes, None],
+        player_id: str,
         pcm_format: AudioFormat,
     ) -> AsyncGenerator[bytes, None]:
         """
-        Wrap a PCM generator with a rain audio overlay mixed in.
+        Wrap audio_input with the active overlay plugin stream if one is active.
 
-        Reads rain PCM from a persistent provider-managed source (rain_reader)
-        and mixes each chunk with the music using numpy.  When the rain reader
-        returns None the music is passed through without overlay.
+        Calling this as an async generator function returns an AsyncGenerator immediately,
+        so it is safe to call from both sync and async contexts.
+
+        :param audio_input: Async generator producing raw PCM bytes.
+        :param player_id: The player (or queue) to check for an active overlay.
+        :param pcm_format: The PCM format used by audio_input.
+        """
+        overlay_prov = self.get_active_overlay_provider(player_id)
+        if overlay_prov is not None:
+            overlay_gen = await overlay_prov.get_overlay_stream(player_id, pcm_format)
+            if overlay_gen is not None:
+                async for chunk in self.apply_audio_overlay(audio_input, overlay_gen, pcm_format):
+                    yield chunk
+                return
+        async for chunk in audio_input:
+            yield chunk
+
+    async def apply_audio_overlay(
+        self,
+        music_gen: AsyncGenerator[bytes, None],
+        overlay_gen: AsyncGenerator[bytes, None],
+        pcm_format: AudioFormat,
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Mix a PCM overlay generator into a PCM music generator.
+
+        Both generators must produce bytes in pcm_format. The overlay is expected
+        to be already volume-adjusted by the plugin.
 
         :param music_gen: Async generator producing raw PCM bytes.
-        :param rain_reader: Async callable (n: int) -> bytes | None from the plugin buffer.
-        :param rain_vol: Rain amplitude multiplier (0.0-1.0).
-        :param pcm_format: PCM format of the music_gen output.
+        :param overlay_gen: Async generator producing volume-adjusted PCM bytes in the same format.
+        :param pcm_format: PCM format shared by both generators.
         """
         fmt = pcm_format.content_type.value
         if "f32" in fmt:
@@ -2293,15 +2316,19 @@ class StreamsAudio:
             dtype = np.int16
             clip_min, clip_max = -32768, 32767
 
+        overlay_buf = bytearray()
         async for music_chunk in music_gen:
-            rain_chunk = await rain_reader(len(music_chunk))
-            if rain_chunk is None or len(rain_chunk) < len(music_chunk):
-                # Rain buffer ended; pass remaining music through without overlay.
-                yield music_chunk
-                async for remaining in music_gen:
-                    yield remaining
-                return
-            rain_arr = np.frombuffer(rain_chunk, dtype=dtype)
+            # Accumulate overlay bytes until we have enough to cover the music chunk.
+            while len(overlay_buf) < len(music_chunk):
+                try:
+                    overlay_buf.extend(await overlay_gen.__anext__())
+                except StopAsyncIteration:
+                    yield music_chunk
+                    async for remaining in music_gen:
+                        yield remaining
+                    return
+            overlay_arr = np.frombuffer(bytes(overlay_buf[: len(music_chunk)]), dtype=dtype)
+            del overlay_buf[: len(music_chunk)]
             music_arr = np.frombuffer(music_chunk, dtype=dtype)
-            mixed = np.clip(music_arr + rain_arr * rain_vol, clip_min, clip_max).astype(dtype)
+            mixed = np.clip(music_arr + overlay_arr, clip_min, clip_max).astype(dtype)
             yield mixed.tobytes()

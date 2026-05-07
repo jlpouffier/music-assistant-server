@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from mashumaro import field_options, pass_through
 from music_assistant_models.enums import ContentType, StreamType
@@ -198,16 +198,30 @@ class PluginProvider(Provider):
         """
         raise NotImplementedError
 
-    def get_player_overlay(self, player_id: str) -> tuple[Any, float] | None:
+    def is_overlay_active(self, player_id: str) -> bool:
         """
-        Return an audio overlay to mix into this player's queue stream.
+        Return whether an audio overlay is currently active for this player.
 
-        Plugins can override this to inject a continuous background audio source
-        (e.g. ambient sound) into the regular queue playback without replacing it.
+        Will only be called if ProviderFeature.AUDIO_OVERLAY is declared.
 
-        :param player_id: The player for which an overlay is requested.
-        :returns: (read_callable, volume_0_to_1) if an overlay is active, else None.
-                  read_callable is async (n: int) -> bytes | None.
+        :param player_id: The player to check.
+        """
+        return False
+
+    async def get_overlay_stream(
+        self,
+        player_id: str,
+        pcm_format: AudioFormat,
+    ) -> AsyncGenerator[bytes, None] | None:
+        """
+        Return a volume-adjusted PCM overlay stream for the given player.
+
+        Will only be called if ProviderFeature.AUDIO_OVERLAY is declared.
+        The returned bytes must be in the same format as pcm_format.
+
+        :param player_id: The player for which the overlay is requested.
+        :param pcm_format: The PCM format the overlay must be produced in.
+        :returns: Async generator of raw PCM bytes, or None if no overlay is active.
         """
         return None
 

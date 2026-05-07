@@ -3,20 +3,22 @@
 Mixes looping rain sounds from rainymood.com transparently into whatever the
 player is already playing from its queue.  The queue is never touched: the
 rain audio is injected into the PCM stream that the streams controller serves
-to the player, by overriding get_player_overlay() on the PluginProvider base.
+to the player, by implementing the AUDIO_OVERLAY plugin interface.
 
 A persistent FFmpeg subprocess is kept alive per player so that rain audio
 continues seamlessly across track transitions and seeks.  The subprocess is
-only restarted when explicitly stopped and re-enabled.
+only restarted when explicitly stopped and re-enabled, or when the PCM format
+changes.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, ProviderConfig
 from music_assistant_models.enums import ConfigEntryType, EventType, PlaybackState, ProviderFeature
 
@@ -24,6 +26,7 @@ from music_assistant.models.plugin import PluginProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.event import MassEvent
+    from music_assistant_models.media_items.audio_format import AudioFormat
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -33,7 +36,7 @@ RAIN_URL = "https://media.rainymood.com/0.mp3"
 
 CONF_RAIN_RATIO = "rain_ratio"
 
-SUPPORTED_FEATURES: set[ProviderFeature] = set()
+SUPPORTED_FEATURES: set[ProviderFeature] = {ProviderFeature.AUDIO_OVERLAY}
 
 
 async def setup(
@@ -70,15 +73,18 @@ async def get_config_entries(
 
 
 class RainBuffer:
-    """Persistent FFmpeg subprocess that streams looping rain PCM (f32le/48000/2ch)."""
+    """Persistent FFmpeg subprocess that streams looping rain PCM."""
 
     def __init__(self) -> None:
         """Initialize the RainBuffer."""
         self._proc: asyncio.subprocess.Process | None = None
+        self._pcm_format: AudioFormat | None = None
 
-    async def start(self) -> None:
-        """Start the FFmpeg rain process."""
+    async def start(self, pcm_format: AudioFormat) -> None:
+        """Start the FFmpeg rain process configured to output pcm_format."""
         await self.stop()
+        self._pcm_format = pcm_format
+        fmt = pcm_format.content_type.value
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -98,11 +104,11 @@ class RainBuffer:
             "-i",
             RAIN_URL,
             "-f",
-            "f32le",
+            fmt,
             "-ar",
-            "48000",
+            str(pcm_format.sample_rate),
             "-ac",
-            "2",
+            str(pcm_format.channels),
             "pipe:1",
         ]
         self._proc = await asyncio.create_subprocess_exec(
@@ -118,6 +124,11 @@ class RainBuffer:
             with suppress(Exception):
                 proc.kill()
 
+    async def ensure_format(self, pcm_format: AudioFormat) -> None:
+        """Restart the subprocess if the requested format differs from the current one."""
+        if self._pcm_format != pcm_format:
+            await self.start(pcm_format)
+
     async def read(self, n: int) -> bytes | None:
         """
         Read exactly n bytes of rain PCM.
@@ -132,12 +143,34 @@ class RainBuffer:
         except (asyncio.IncompleteReadError, Exception):
             return None
 
+    async def scaled_stream(
+        self, rain_vol: float, pcm_format: AudioFormat
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Yield rain PCM chunks scaled by rain_vol.
+
+        :param rain_vol: Volume multiplier (1.0 = same level as music).
+        :param pcm_format: PCM format for dtype selection.
+        """
+        fmt = pcm_format.content_type.value
+        dtype: Any = np.float32 if "f32" in fmt else np.int16
+        clip_min: float = -1.0 if dtype == np.float32 else -32768
+        clip_max: float = 1.0 if dtype == np.float32 else 32767
+        chunk_size = 4096
+        while True:
+            data = await self.read(chunk_size)
+            if data is None:
+                return
+            arr = np.frombuffer(data, dtype=dtype)
+            scaled = np.clip(arr * rain_vol, clip_min, clip_max).astype(dtype)
+            yield scaled.tobytes()
+
 
 class RainyMoodPlugin(PluginProvider):
     """Rainy Mood Plugin Provider.
 
-    When enabled for a player, returns an overlay via get_player_overlay() so
-    the streams controller can mix rain into the regular queue PCM output.
+    When enabled for a player, implements the AUDIO_OVERLAY interface so the
+    streams controller can mix rain into the regular queue PCM output.
     A persistent RainBuffer ensures rain audio continues seamlessly across
     track transitions and seeks without restarting from the beginning.
     """
@@ -185,23 +218,37 @@ class RainyMoodPlugin(PluginProvider):
         self._active_players.clear()
 
     # ------------------------------------------------------------------
-    # Overlay interface (called by the streams controller)
+    # AUDIO_OVERLAY interface (called by the streams controller)
     # ------------------------------------------------------------------
 
-    def get_player_overlay(self, player_id: str) -> tuple[Any, float] | None:
+    def is_overlay_active(self, player_id: str) -> bool:
         """
-        Return the rain overlay reader for this player if active.
+        Return whether the rain overlay is currently active for this player.
 
-        :param player_id: The player for which an overlay is requested.
-        :returns: (read_callable, rain_volume_0_to_1) if rain is enabled, else None.
+        :param player_id: The player to check.
+        """
+        return player_id in self._active_players
+
+    async def get_overlay_stream(
+        self,
+        player_id: str,
+        pcm_format: AudioFormat,
+    ) -> AsyncGenerator[bytes, None] | None:
+        """
+        Return a volume-adjusted PCM rain stream matching pcm_format.
+
+        :param player_id: The player for which the overlay is requested.
+        :param pcm_format: The PCM format the overlay must be produced in.
+        :returns: Async generator of raw PCM bytes, or None if overlay is not active.
         """
         if player_id not in self._active_players:
             return None
         buf = self._rain_buffers.get(player_id)
         if buf is None:
             return None
+        await buf.ensure_format(pcm_format)
         rain_vol = float(cast("int", self.config.get_value(CONF_RAIN_RATIO))) / 100.0
-        return (buf.read, rain_vol)
+        return buf.scaled_stream(rain_vol, pcm_format)
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -231,7 +278,7 @@ class RainyMoodPlugin(PluginProvider):
         if player_id in self._active_players:
             return {"active": True}
         self._active_players.add(player_id)
-        await self._start_rain_buffer(player_id)
+        self._rain_buffers[player_id] = RainBuffer()
         self.logger.info("Rainy Mood enabled for player %s", player_id)
         queue = self.mass.player_queues.get(player_id)
         if queue and queue.state == PlaybackState.PLAYING:
@@ -254,11 +301,6 @@ class RainyMoodPlugin(PluginProvider):
         if queue and queue.state == PlaybackState.PLAYING:
             await self._restart_stream(player_id)
         return {"active": False}
-
-    async def _start_rain_buffer(self, player_id: str) -> None:
-        buf = RainBuffer()
-        await buf.start()
-        self._rain_buffers[player_id] = buf
 
     async def _stop_rain_buffer(self, player_id: str) -> None:
         buf = self._rain_buffers.pop(player_id, None)
